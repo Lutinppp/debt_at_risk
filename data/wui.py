@@ -17,8 +17,9 @@ import io
 DATA_DIR = Path(__file__).parent
 WUI_CACHE = DATA_DIR / "wui_raw.parquet"
 
-# Known download URLs for WUI data
+# Known download URLs for WUI data (update when new vintage released)
 WUI_URLS = [
+    "https://worlduncertaintyindex.com/wp-content/uploads/2026/01/WUI_Data.xlsx",
     "https://worlduncertaintyindex.com/wp-content/uploads/2023/10/WUI_Data.xlsx",
     "https://worlduncertaintyindex.com/wp-content/uploads/2021/08/WUI_Data.xlsx",
 ]
@@ -62,18 +63,29 @@ WUI_NAME_TO_ISO3 = {
 }
 
 
-def _download_wui() -> pd.DataFrame | None:
-    """Attempt to download WUI Excel file from known URLs."""
+def _download_wui() -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Download WUI Excel from known URLs and return (raw_df, sheet_name).
+
+    Prefers sheet 'T2' which is the wide-format quarterly panel
+    (rows = quarters like '2024q1', columns = iso3 codes).
+    """
     for url in WUI_URLS:
         try:
             print(f"  Downloading WUI from {url} …")
-            resp = requests.get(url, timeout=60)
-            if resp.status_code == 200:
-                xl = pd.read_excel(io.BytesIO(resp.content), sheet_name=None, engine="openpyxl")
-                # Try to find the main data sheet
-                for sheet_name, sheet_df in xl.items():
-                    if sheet_df.shape[1] > 5 and sheet_df.shape[0] > 10:
-                        return sheet_df, sheet_name
+            resp = requests.get(url, timeout=120)
+            if resp.status_code != 200:
+                continue
+            xl = pd.read_excel(io.BytesIO(resp.content), sheet_name=None, engine="openpyxl")
+
+            # Prefer T2 sheet (wide quarterly iso3 panel)
+            if "T2" in xl:
+                return xl["T2"], "T2"
+
+            # Fallback: any sheet with many columns (country panel)
+            for sheet_name, sheet_df in xl.items():
+                if sheet_df.shape[1] > 50:
+                    return sheet_df, sheet_name
         except Exception as exc:
             print(f"    Could not download from {url}: {exc}")
     return None, None
@@ -113,46 +125,57 @@ def _build_synthetic_wui() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _parse_wui_df(raw: pd.DataFrame) -> pd.DataFrame:
+def _parse_wui_df(raw: pd.DataFrame, sheet_name: str = "") -> pd.DataFrame:
     """
-    Parse the raw WUI Excel sheet into iso3, year, wui long format.
-    WUI Excel has: Country in col 0, quarterly data in subsequent columns.
+    Parse the raw WUI sheet into iso3, year, wui long format.
+
+    Handles two layouts:
+      T2 layout  – first column is 'year' with quarterly strings like '2024q1',
+                   remaining columns are iso3 codes (e.g. FRA, DEU …).
+      Legacy     – first column is country names, remaining columns are date
+                   labels (quarterly or annual period strings).
     """
-    # Identify country column and date columns
     raw = raw.copy()
     raw.columns = [str(c).strip() for c in raw.columns]
+    first_col = raw.columns[0]
 
-    # First column is country names, remainder are quarterly periods
-    country_col = raw.columns[0]
-    date_cols = raw.columns[1:]
+    # ── T2 layout: year col contains '1952q1' strings, others are iso3 ──────
+    if first_col.lower() == "year" or str(raw.iloc[0, 0]).lower().endswith("q1"):
+        # Extract integer year from strings like '2024q1', '2024Q1', 2024.0 ...
+        raw["_year"] = (
+            raw[first_col].astype(str)
+            .str.extract(r"(\d{4})")[0]
+            .pipe(pd.to_numeric, errors="coerce")
+        )
+        raw = raw.dropna(subset=["_year"])
+        raw["_year"] = raw["_year"].astype(int)
 
-    # Melt to long format
-    melted = raw.melt(id_vars=[country_col], value_vars=date_cols,
-                       var_name="period", value_name="wui")
-    melted = melted.rename(columns={country_col: "country"})
-    melted = melted.dropna(subset=["wui"])
+        iso3_cols = [c for c in raw.columns
+                     if c not in (first_col, "_year") and len(c) == 3 and c.isupper()]
+        melted = raw[["_year"] + iso3_cols].melt(
+            id_vars=["_year"], var_name="iso3", value_name="wui"
+        ).rename(columns={"_year": "year"})
+
+    # ── Legacy layout: first col is country name, rest are period labels ─────
+    else:
+        date_cols = raw.columns[1:]
+        melted = raw.melt(id_vars=[first_col], value_vars=date_cols,
+                          var_name="period", value_name="wui")
+        melted = melted.rename(columns={first_col: "country"})
+        melted["year"] = (
+            melted["period"].astype(str).str.extract(r"(\d{4})")[0]
+            .pipe(pd.to_numeric, errors="coerce")
+        )
+        melted["iso3"] = melted["country"].map(WUI_NAME_TO_ISO3)
+        melted = melted.dropna(subset=["iso3"])
+
     melted["wui"] = pd.to_numeric(melted["wui"], errors="coerce")
-    melted = melted.dropna(subset=["wui"])
-
-    # Extract year from period string (e.g., "1990Q1" → 1990)
-    melted["year"] = (
-        melted["period"].str.extract(r"(\d{4})")[0]
-        .pipe(pd.to_numeric, errors="coerce")
-        .dropna()
-        .astype(int)
-    )
-    melted = melted.dropna(subset=["year"])
+    melted = melted.dropna(subset=["wui", "year", "iso3"])
     melted["year"] = melted["year"].astype(int)
     melted = melted[(melted["year"] >= 1990) & (melted["year"] <= 2025)]
 
-    # Annual average
-    annual = (melted.groupby(["country", "year"])["wui"].mean().reset_index())
-
-    # Map country names to iso3
-    annual["iso3"] = annual["country"].map(WUI_NAME_TO_ISO3)
-    annual = annual.dropna(subset=["iso3"])
-
-    return annual[["iso3", "year", "wui"]].reset_index(drop=True)
+    annual = melted.groupby(["iso3", "year"])["wui"].mean().reset_index()
+    return annual.reset_index(drop=True)
 
 
 def fetch_wui(csv_path: str | None = None, save: bool = True) -> pd.DataFrame:
@@ -182,7 +205,7 @@ def fetch_wui(csv_path: str | None = None, save: bool = True) -> pd.DataFrame:
     if df is None:
         raw, sheet_name = _download_wui()
         if raw is not None:
-            df = _parse_wui_df(raw)
+            df = _parse_wui_df(raw, sheet_name or "")
             print(f"  Parsed WUI sheet '{sheet_name}': {len(df)} rows")
 
     # Option 3: synthetic fallback

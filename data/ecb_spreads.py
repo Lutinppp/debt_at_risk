@@ -1,112 +1,71 @@
 """
-ECB Statistical Data Warehouse (SDW) pull — 10-year sovereign spreads vs. Bund.
+Eurostat 10-year Maastricht criterion bond yields — sovereign spreads vs. Bund.
 
-Uses the ECB SDW REST API (no key required):
-  https://data-api.ecb.europa.eu/service/data/
+Primary source: Eurostat SDMX 2.1 REST API, dataset IRT_LT_MCBY_A
+  https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/IRT_LT_MCBY_A
+  ?format=SDMX-CSV&startPeriod=<YEAR>&geo=FR+DE+IT+ES
 
-Series: Monthly 10Y government bond yields from ECB/euro area statistics.
-Spread = country yield − Germany (Bund) yield, averaged to annual.
-
+Spread = country yield − Germany (Bund) yield, annual average.
 Countries: FR (FRA), DE (DEU), IT (ITA), ES (ESP)
+Fallback: compiled historical table if Eurostat API is unavailable.
 """
 
+import io
 import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
-import time
 
-DATA_DIR = Path(__file__).parent
-BASE_URL = "https://data-api.ecb.europa.eu/service/data"
-
-# ECB SDW series keys for 10Y government bond yields (monthly, %p.a.)
-# URL format: BASE_URL/<DATASET>/<SERIES_KEY>
-# IRS = Interest Rate Statistics; series dimensions separated by dots
-YIELD_SERIES = {
-    "DEU": ("IRS", "M.DE.L.L40.CI.0.EUR.N.Z"),
-    "FRA": ("IRS", "M.FR.L.L40.CI.0.EUR.N.Z"),
-    "ITA": ("IRS", "M.IT.L.L40.CI.0.EUR.N.Z"),
-    "ESP": ("IRS", "M.ES.L.L40.CI.0.EUR.N.Z"),
-}
-
-ISO3_TO_ECB = {"DEU": "DE", "FRA": "FR", "ITA": "IT", "ESP": "ES"}
-START_YEAR = 1990
-END_YEAR   = 2025
+DATA_DIR      = Path(__file__).parent
+EUROSTAT_URL  = ("https://ec.europa.eu/eurostat/api/dissemination/"
+                 "sdmx/2.1/data/IRT_LT_MCBY_A")
+GEO_TO_ISO3   = {"FR": "FRA", "DE": "DEU", "IT": "ITA", "ES": "ESP"}
+G4_GEOS       = list(GEO_TO_ISO3.keys())   # ["FR", "DE", "IT", "ES"]
+START_YEAR    = 1990
+END_YEAR      = 2025
 
 
-def _fetch_series(dataset: str, series_key: str) -> pd.Series:
+def _fetch_eurostat_yields() -> pd.DataFrame | None:
     """
-    Fetch a single ECB SDW time series. Returns pd.Series indexed by period string.
+    Download annual 10Y Maastricht bond yields for G4 from Eurostat IRT_LT_MCBY_A.
+    Returns DataFrame with columns [iso3, year, yield_10y, spread_10y], or None on failure.
     """
-    url = f"{BASE_URL}/{dataset}/{series_key}?detail=dataonly&format=csvdata"
-    headers = {"Accept": "text/csv"}
-
-    for attempt in range(3):
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            if resp.status_code == 404:
-                return pd.Series(dtype=float)
-            resp.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            if attempt == 2:
-                print(f"    Warning: could not fetch {series_key}: {exc}")
-                return pd.Series(dtype=float)
-            time.sleep(2 ** attempt)
-
-    # Parse CSV response
-    from io import StringIO
+    params = {
+        "format":      "SDMX-CSV",
+        "startPeriod": str(START_YEAR),
+        "geo":         "+".join(G4_GEOS),
+    }
     try:
-        df = pd.read_csv(StringIO(resp.text), comment="*", low_memory=False)
-        # ECB CSV format: columns include TIME_PERIOD and OBS_VALUE
-        if "TIME_PERIOD" not in df.columns or "OBS_VALUE" not in df.columns:
-            # Try alternate parsing
-            df = pd.read_csv(StringIO(resp.text), skiprows=5, low_memory=False)
-        if "TIME_PERIOD" in df.columns and "OBS_VALUE" in df.columns:
-            df["OBS_VALUE"] = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
-            return df.set_index("TIME_PERIOD")["OBS_VALUE"]
-    except Exception as exc:
-        print(f"    Warning: parse error for {series_key}: {exc}")
-
-    return pd.Series(dtype=float)
-
-
-def _fetch_yield_json(iso2: str) -> pd.Series:
-    """Fetch 10Y yield via JSON format as fallback."""
-    # ECB SDMX-JSON: dataset/series_key format
-    url = (f"https://data-api.ecb.europa.eu/service/data/IRS/"
-           f"M.{iso2}.L.L40.CI.0.EUR.N.Z?format=jsondata&detail=dataonly")
-    try:
-        resp = requests.get(url, timeout=60)
+        resp = requests.get(EUROSTAT_URL, params=params, timeout=60)
         if resp.status_code != 200:
-            return pd.Series(dtype=float)
-        data = resp.json()
-        # Navigate SDMX-JSON structure
-        series_data = data.get("dataSets", [{}])[0].get("series", {})
-        time_periods = data.get("structure", {}).get("dimensions", {}).get("observation", [{}])[0].get("values", [])
-        
-        records = {}
-        for series_key_inner, series_val in series_data.items():
-            for obs_key, obs_val in series_val.get("observations", {}).items():
-                idx = int(obs_key)
-                if idx < len(time_periods):
-                    period = time_periods[idx].get("id", "")
-                    val = obs_val[0] if obs_val else None
-                    if val is not None:
-                        records[period] = float(val)
+            print(f"    Eurostat returned HTTP {resp.status_code} — falling back.")
+            return None
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception as exc:
+        print(f"    Eurostat fetch error: {exc} — falling back.")
+        return None
 
-        return pd.Series(records)
-    except Exception:
-        return pd.Series(dtype=float)
+    df = df.rename(columns={"OBS_VALUE": "yield_10y", "TIME_PERIOD": "year", "geo": "geo2"})
+    df["iso3"]     = df["geo2"].map(GEO_TO_ISO3)
+    df["year"]     = pd.to_numeric(df["year"], errors="coerce")
+    df["yield_10y"] = pd.to_numeric(df["yield_10y"], errors="coerce")
+    df = df.dropna(subset=["iso3", "year", "yield_10y"])
+    df["year"] = df["year"].astype(int)
+
+    # Spread = country yield − Bund yield
+    bund = df[df["iso3"] == "DEU"].set_index("year")["yield_10y"]
+    df["spread_10y"] = df.apply(
+        lambda r: r["yield_10y"] - bund.get(r["year"], np.nan), axis=1
+    )
+
+    return df[["iso3", "year", "yield_10y", "spread_10y"]].sort_values(["iso3", "year"])
 
 
-def _historical_spread_fallback() -> pd.DataFrame:
+def _compiled_fallback() -> pd.DataFrame:
     """
-    Historical 10Y sovereign spread data (vs. Bund) compiled from ECB/Eurostat
-    annual averages. Used when the live API is unavailable.
-
-    Sources: ECB Statistical Data Warehouse, Eurostat long-term interest rate series.
-    Values in percentage points (annual average).
+    Compiled historical 10Y sovereign yield data (from ECB/Eurostat publications).
+    Used only when the live Eurostat API is unavailable.
+    Values in % p.a. (annual average).
     """
     # Annual average 10Y yields (% p.a.) — compiled from ECB/Eurostat publications
     yields = {
@@ -159,59 +118,21 @@ def _historical_spread_fallback() -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _annual_from_monthly(series: pd.Series, start: int, end: int) -> pd.Series:
-    """Convert monthly period strings (YYYY-MM) to annual averages."""
-    records = {}
-    for period, val in series.items():
-        try:
-            year = int(str(period)[:4])
-            if start <= year <= end:
-                records.setdefault(year, []).append(float(val))
-        except (ValueError, TypeError):
-            continue
-    return pd.Series({yr: np.mean(vals) for yr, vals in records.items()})
-
-
 def fetch_spreads(save: bool = True) -> pd.DataFrame:
     """
-    Fetch 10Y sovereign spreads vs. Bund for FR, DE, IT, ES.
+    Fetch 10Y sovereign yields and spreads vs. Bund for FR, DE, IT, ES.
+    Primary: Eurostat IRT_LT_MCBY_A.  Fallback: compiled historical table.
 
-    Returns DataFrame: iso3, year, spread_10y (percentage points).
+    Returns DataFrame: iso3, year, yield_10y, spread_10y (percentage points).
     """
-    print("  Fetching ECB 10Y sovereign yields …")
-    annual_yields = {}
+    print("  Fetching Eurostat 10Y sovereign yields (IRT_LT_MCBY_A) …")
+    df = _fetch_eurostat_yields()
 
-    for iso3, (dataset, series_key) in YIELD_SERIES.items():
-        iso2 = ISO3_TO_ECB[iso3]
-        print(f"    {iso3} ({dataset}/{series_key}) …")
-        monthly = _fetch_series(dataset, series_key)
-        if monthly.empty:
-            monthly = _fetch_yield_json(iso2)
-        annual = _annual_from_monthly(monthly, START_YEAR, END_YEAR)
-        annual_yields[iso3] = annual
+    if df is None or df["spread_10y"].notna().sum() == 0:
+        print("  Eurostat unavailable — using compiled historical fallback.")
+        df = _compiled_fallback()
 
-    # Compute spread = country − Germany
-    bund = annual_yields.get("DEU", pd.Series(dtype=float))
-
-    records = []
-    for iso3, annual in annual_yields.items():
-        for year in range(START_YEAR, END_YEAR + 1):
-            country_yield = annual.get(year, np.nan)
-            bund_yield    = bund.get(year, np.nan)
-            spread        = country_yield - bund_yield if not (np.isnan(country_yield) or np.isnan(bund_yield)) else np.nan
-            records.append({
-                "iso3":       iso3,
-                "year":       year,
-                "yield_10y":  country_yield,
-                "spread_10y": spread,
-            })
-
-    df = pd.DataFrame(records).sort_values(["iso3", "year"]).reset_index(drop=True)
-
-    # Fall back to compiled historical data if API returned nothing useful
-    if df["spread_10y"].notna().sum() == 0:
-        print("  ECB API returned no spread data — using compiled historical fallback.")
-        df = _historical_spread_fallback().sort_values(["iso3", "year"]).reset_index(drop=True)
+    df = df.sort_values(["iso3", "year"]).reset_index(drop=True)
 
     if save:
         out = DATA_DIR / "ecb_spreads_raw.parquet"
